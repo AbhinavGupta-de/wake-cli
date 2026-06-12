@@ -158,6 +158,7 @@ public final class Wake {
             try {
                 cafProc = spawnDetachedProcess(cmd);
                 s.pid = cafProc.pid();
+                requireChildAlive(s.pid, cmd);
                 s.captureProcessIdentity();
                 Session.write(s);
             } catch (Exception t) {
@@ -290,6 +291,27 @@ public final class Wake {
 
     static boolean isAlive(long pid) {
         return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
+    }
+
+    static boolean verifyChildAlive(long pid) throws InterruptedException {
+        Thread.sleep(300);
+        return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
+    }
+
+    static void requireChildAlive(long pid, List<String> cmd) throws InterruptedException {
+        if (verifyChildAlive(pid)) return;
+        System.err.printf("wake: keep-awake process exited immediately (%s) — see platform requirements%n",
+                commandBasename(cmd));
+        System.exit(1);
+    }
+
+    private static String commandBasename(List<String> cmd) {
+        if (cmd == null || cmd.isEmpty() || cmd.get(0) == null || cmd.get(0).isBlank()) {
+            return "unknown";
+        }
+        String executable = cmd.get(0);
+        int slash = Math.max(executable.lastIndexOf('/'), executable.lastIndexOf('\\'));
+        return slash >= 0 ? executable.substring(slash + 1) : executable;
     }
 
     static long secondsUntil(String hhmm) {

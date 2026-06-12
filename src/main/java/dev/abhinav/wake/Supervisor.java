@@ -33,12 +33,14 @@ final class Supervisor {
             try { Files.deleteIfExists(Wake.STATE_FILE); } catch (Throwable ignored) {}
         }));
 
-        ProcessBuilder keepAwake = new ProcessBuilder(Wake.PLATFORM.keepAwakeCommand(noDisplay, null, null));
+        var keepAwakeCmd = Wake.PLATFORM.keepAwakeCommand(noDisplay, null, null);
+        ProcessBuilder keepAwake = new ProcessBuilder(keepAwakeCmd);
         keepAwake.redirectInput(ProcessBuilder.Redirect.from(Wake.PLATFORM.devNull()));
         keepAwake.redirectOutput(ProcessBuilder.Redirect.DISCARD);
         keepAwake.redirectError(ProcessBuilder.Redirect.DISCARD);
         Process keepAwakeProc = keepAwake.start();
         keepAwakeProcRef.set(keepAwakeProc);
+        Wake.requireChildAlive(keepAwakeProc.pid(), keepAwakeCmd);
 
         Session s = new Session();
         s.pid = ProcessHandle.current().pid();

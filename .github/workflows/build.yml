@@ -52,7 +52,13 @@ jobs:
       - name: Build native image
         if: runner.os == 'Windows'
         shell: pwsh
-        run: native-image --no-fallback -O2 -jar target\wake.jar target\wake.exe
+        run: |
+          native-image --no-fallback -O2 -jar target\wake.jar target\wake
+          if (-not (Test-Path -LiteralPath 'target\wake.exe')) {
+            Get-ChildItem -LiteralPath target
+            throw 'native-image did not produce target\wake.exe'
+          }
+          Get-ChildItem -LiteralPath target
 
       - name: Smoke test
         if: runner.os != 'Windows'
@@ -118,6 +124,7 @@ jobs:
           run_ok forever --no-display | grep -F "session active"
           run_ok status | grep -F "session active"
           if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sleep 2
             systemd-inhibit --list --no-pager | tee "$RUNNER_TEMP/wake-inhibitors.txt"
             grep -F "wake" "$RUNNER_TEMP/wake-inhibitors.txt"
           fi
