@@ -4,19 +4,15 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Instant;
-import java.util.Locale;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 final class Supervisor {
-    private static final Pattern PCT = Pattern.compile("(\\d+)%");
     private static final long POLL_INTERVAL_MS = 30_000;
 
     static void runCharge(String[] args) throws Exception {
         if (args.length < 4) throw new IllegalStateException("supervisor: bad args");
         int target = Integer.parseInt(args[1]);
-        char modeChar = args[2].charAt(0);
+        boolean noDisplay = Boolean.parseBoolean(args[2]);
         String modeName = args[3];
 
         BatteryStatus initial;
@@ -31,20 +27,20 @@ final class Supervisor {
         if (plan.alreadyMet) return;
         boolean chargingUp = plan.chargingUp;
 
-        AtomicReference<Process> cafProcRef = new AtomicReference<>();
+        AtomicReference<Process> keepAwakeProcRef = new AtomicReference<>();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            Process p = cafProcRef.get();
+            Process p = keepAwakeProcRef.get();
             try { if (p != null) p.destroy(); } catch (Throwable ignored) {}
             try { Files.deleteIfExists(Wake.STATE_FILE); } catch (Throwable ignored) {}
         }));
 
-        ProcessBuilder caf = new ProcessBuilder(Wake.CAFFEINATE, "-" + modeChar);
+        ProcessBuilder keepAwake = new ProcessBuilder(Wake.PLATFORM.keepAwakeCommand(noDisplay, null, null));
         File devnull = new File("/dev/null");
-        caf.redirectInput(ProcessBuilder.Redirect.from(devnull));
-        caf.redirectOutput(ProcessBuilder.Redirect.to(devnull));
-        caf.redirectError(ProcessBuilder.Redirect.to(devnull));
-        Process cafProc = caf.start();
-        cafProcRef.set(cafProc);
+        keepAwake.redirectInput(ProcessBuilder.Redirect.from(devnull));
+        keepAwake.redirectOutput(ProcessBuilder.Redirect.to(devnull));
+        keepAwake.redirectError(ProcessBuilder.Redirect.to(devnull));
+        Process keepAwakeProc = keepAwake.start();
+        keepAwakeProcRef.set(keepAwakeProc);
 
         Session s = new Session();
         s.pid = ProcessHandle.current().pid();
@@ -57,13 +53,13 @@ final class Supervisor {
             s.captureProcessIdentity();
             Session.write(s);
         } catch (Exception t) {
-            Wake.destroyProcess(cafProc);
+            Wake.destroyProcess(keepAwakeProc);
             throw t;
         }
 
         while (true) {
             Thread.sleep(POLL_INTERVAL_MS);
-            if (!cafProc.isAlive()) break;
+            if (!keepAwakeProc.isAlive()) break;
             BatteryStatus status;
             try {
                 status = readBatteryStatus();
@@ -72,8 +68,8 @@ final class Supervisor {
             }
             if (chargingUp ? status.percent >= target : status.percent <= target) break;
         }
-        cafProc.destroy();
-        cafProc.waitFor();
+        keepAwakeProc.destroy();
+        keepAwakeProc.waitFor();
         try { Files.deleteIfExists(Wake.STATE_FILE); } catch (Throwable ignored) {}
     }
 
@@ -82,18 +78,7 @@ final class Supervisor {
     }
 
     static BatteryStatus readBatteryStatus() throws IOException, InterruptedException {
-        ProcessBuilder pb = new ProcessBuilder("/usr/bin/pmset", "-g", "batt");
-        pb.redirectError(ProcessBuilder.Redirect.DISCARD);
-        Process p = pb.start();
-        String out = new String(p.getInputStream().readAllBytes());
-        p.waitFor();
-        Matcher m = PCT.matcher(out);
-        if (!m.find()) throw new IOException("cannot parse battery percentage from pmset");
-        int percent = Integer.parseInt(m.group(1));
-        String lower = out.toLowerCase(Locale.ROOT);
-        boolean discharging = lower.contains("discharging") || lower.contains("battery power");
-        boolean charging = lower.contains("; charging;") || lower.contains("ac power");
-        return new BatteryStatus(percent, charging, discharging);
+        return Wake.PLATFORM.readBattery();
     }
 
     static ChargePlan planCharge(int target, BatteryStatus status) {
@@ -110,18 +95,28 @@ final class Supervisor {
             return ChargePlan.waiting(true);
         }
         if (status.percent == target) return ChargePlan.alreadyMet();
-        throw new Wake.UsageError("cannot determine battery charging direction from pmset output");
+        if (status.neutralState != null) {
+            throw new Wake.UsageError("--until-charge " + target + " is unreachable while battery is "
+                    + status.neutralState + " at " + status.percent + "%");
+        }
+        throw new Wake.UsageError("cannot determine battery charging direction");
     }
 
     static final class BatteryStatus {
         final int percent;
         final boolean charging;
         final boolean discharging;
+        final String neutralState;
 
         BatteryStatus(int percent, boolean charging, boolean discharging) {
+            this(percent, charging, discharging, null);
+        }
+
+        BatteryStatus(int percent, boolean charging, boolean discharging, String neutralState) {
             this.percent = percent;
             this.charging = charging;
             this.discharging = discharging;
+            this.neutralState = neutralState;
         }
     }
 

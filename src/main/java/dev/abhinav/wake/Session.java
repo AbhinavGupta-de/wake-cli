@@ -139,8 +139,7 @@ final class Session {
         Path fileName = commandPath.getFileName();
         String base = fileName == null ? "" : fileName.toString().toLowerCase(Locale.ROOT);
         String line = commandLine == null ? "" : commandLine.toLowerCase(Locale.ROOT);
-        return base.equals("caffeinate")
-                || base.equals("wake")
+        return Wake.PLATFORM.expectedCommandBasenames().contains(base)
                 || line.contains("wake.jar")
                 || line.contains("dev.abhinav.wake.wake");
     }

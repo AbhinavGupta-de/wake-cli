@@ -114,8 +114,8 @@ final class Interactive {
                     i -> i.askAndStart("Until clock time (HH:MM)", "--until")));
             items.add(new MenuItem("Until battery %…",    "until charge hits N%",
                     i -> i.askAndStart("Target battery percent (1-100)", "--until-charge")));
-            items.add(new MenuItem("While app running…",  "watch a running mac app",
-                    i -> i.askAndStart("App name (e.g. Music, Final Cut Pro)", "--while-app")));
+            items.add(new MenuItem("While app running…",  "watch a running app/process",
+                    i -> i.askAndStart("App/process name", "--while-app")));
             items.add(new MenuItem("While PID alive…",    "watch a specific process id",
                     i -> i.askAndStart("PID to watch", "--while-pid")));
         }
@@ -149,7 +149,7 @@ final class Interactive {
         StringBuilder sb = new StringBuilder(2048);
         sb.append(CLEAR).append(HOME).append('\n');
         sb.append("  ").append(BOLD).append(FG_CYAN).append("☕ wake").append(RESET);
-        sb.append("  ").append(DIM).append("— keep your mac awake").append(RESET).append("\n\n");
+        sb.append("  ").append(DIM).append("— keep your machine awake").append(RESET).append("\n\n");
 
         if (existing != null) {
             sb.append("  ").append(FG_YELLOW).append("● active").append(RESET)

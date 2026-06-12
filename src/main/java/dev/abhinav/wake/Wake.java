@@ -14,15 +14,14 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 public final class Wake {
 
     static final Path STATE_DIR = Path.of(System.getProperty("user.home"), ".local/state/wake");
     static final Path STATE_FILE = STATE_DIR.resolve("session.properties");
-    static final String VERSION = "0.1.0";
-    static final String CAFFEINATE = "/usr/bin/caffeinate";
+    static final String VERSION = "0.2.0";
+    static final Platform PLATFORM = Platform.detect();
 
     public static void main(String[] args) {
         try {
@@ -110,7 +109,7 @@ public final class Wake {
                     if (i + 1 >= args.length) throw new UsageError("missing value for --while-app");
                     triggerFlag = claimTrigger(triggerFlag, a);
                     String appName = args[++i];
-                    waitPid = findAppPid(appName);
+                    waitPid = PLATFORM.findAppPid(appName);
                     if (waitPid == null) throw new UsageError("no running process matching '" + appName + "'");
                     triggerDetail = "app '" + appName + "' (pid " + waitPid + ")";
                     trigger = "while-app";
@@ -137,16 +136,13 @@ public final class Wake {
             }
 
             String mode = noDisplay ? "system-only" : "display+system";
-            char caffeinateMode = noDisplay ? 'i' : 'd';
 
             if (chargeTarget != null) {
-                startSupervisor(chargeTarget, mode, caffeinateMode);
+                startSupervisor(chargeTarget, mode, noDisplay);
                 return;
             }
 
-            List<String> cmd = new ArrayList<>(List.of(CAFFEINATE, "-" + caffeinateMode));
-            if (timeoutSec != null) { cmd.add("-t"); cmd.add(String.valueOf(timeoutSec)); }
-            if (waitPid != null) { cmd.add("-w"); cmd.add(String.valueOf(waitPid)); }
+            List<String> cmd = PLATFORM.keepAwakeCommand(noDisplay, timeoutSec, waitPid);
 
             Session s = new Session();
             s.mode = mode;
@@ -171,7 +167,7 @@ public final class Wake {
         }
     }
 
-    static void startSupervisor(int chargeTarget, String mode, char caffeinateMode) throws Exception {
+    static void startSupervisor(int chargeTarget, String mode, boolean noDisplay) throws Exception {
         Supervisor.BatteryStatus status = Supervisor.readBatteryStatus();
         Supervisor.ChargePlan plan = Supervisor.planCharge(chargeTarget, status);
         if (plan.alreadyMet) {
@@ -182,7 +178,7 @@ public final class Wake {
         List<String> cmd = new ArrayList<>(selfCommand());
         cmd.add("__supervise_charge__");
         cmd.add(String.valueOf(chargeTarget));
-        cmd.add(String.valueOf(caffeinateMode));
+        cmd.add(String.valueOf(noDisplay));
         cmd.add(mode);
         spawnDetached(cmd);
 
@@ -277,50 +273,6 @@ public final class Wake {
         return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
     }
 
-    static Long findAppPid(String name) throws Exception {
-        Long exact = firstAllowedPid(pgrep("-i", "-x", name));
-        if (exact != null) return exact;
-        return firstAllowedPid(pgrep("-i", "-f", name));
-    }
-
-    static List<Long> pgrep(String... args) throws Exception {
-        List<String> cmd = new ArrayList<>(List.of("/usr/bin/pgrep"));
-        cmd.addAll(Arrays.asList(args));
-        ProcessBuilder pb = new ProcessBuilder(cmd);
-        pb.redirectError(ProcessBuilder.Redirect.DISCARD);
-        Process p = pb.start();
-        String out = new String(p.getInputStream().readAllBytes()).trim();
-        p.waitFor();
-        List<Long> pids = new ArrayList<>();
-        if (out.isEmpty()) return pids;
-        for (String line : out.split("\n")) {
-            try {
-                if (!line.isBlank()) pids.add(Long.parseLong(line.trim()));
-            } catch (NumberFormatException ignored) {}
-        }
-        return pids;
-    }
-
-    static Long firstAllowedPid(List<Long> pids) {
-        for (long pid : pids) {
-            if (isAllowedAppPid(pid)) return pid;
-        }
-        return null;
-    }
-
-    static boolean isAllowedAppPid(long pid) {
-        long self = ProcessHandle.current().pid();
-        long parent = ProcessHandle.current().parent().map(ProcessHandle::pid).orElse(-1L);
-        if (pid == self || pid == parent) return false;
-        ProcessHandle handle = ProcessHandle.of(pid).orElse(null);
-        if (handle == null || !handle.isAlive()) return false;
-        ProcessHandle.Info info = handle.info();
-        String command = info.command().orElse("");
-        String commandLine = info.commandLine().orElse(command);
-        String haystack = (command + " " + commandLine).toLowerCase(Locale.ROOT);
-        return !haystack.contains("wake") && !haystack.contains("java");
-    }
-
     static long secondsUntil(String hhmm) {
         String[] parts = hhmm.split(":");
         if (parts.length != 2) throw new UsageError("--until expects HH:MM, got '" + hhmm + "'");
@@ -379,7 +331,10 @@ public final class Wake {
 
     static void printHelp() {
         System.out.println("""
-                wake — keep your mac awake from the CLI
+                wake — keep your machine awake from the CLI
+
+                platforms:
+                  macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd
 
                 interactive:
                   wake                       open the picker (when run in a terminal)
