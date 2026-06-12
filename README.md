@@ -37,12 +37,27 @@ On macOS/Linux, running `wake` in an interactive terminal opens the picker:
 
 ## Supported Platforms
 
-- macOS: uses `caffeinate` for sleep assertions and `pmset` for battery state.
-- Linux: uses `systemd-inhibit`; requires systemd >= 190. Battery sessions read `/sys/class/power_supply`.
-- Windows: uses Windows PowerShell to call `SetThreadExecutionState`, preventing system and display sleep while the child PowerShell process is alive.
+### macOS
+
+macOS uses `caffeinate` for sleep assertions and `pmset` for battery state.
+
+#### Limitations
+
+`wake` blocks idle sleep on macOS; it cannot block forced sleep. Closing the lid or choosing Sleep from the Apple menu still sleeps the Mac. Amphetamine has the same macOS constraint. The root-only workaround is `sudo pmset disablesleep 1`, which is deliberately not built in.
+
+This differs from Linux, where systemd can inhibit lid-switch sleep.
+
+### Linux
+
+Linux uses `systemd-inhibit`; requires systemd >= 190. Battery sessions read `/sys/class/power_supply`.
 
 On Linux, display-sleep prevention is limited to idle/sleep inhibitors. Desktop-environment display blanking controls such as X11 `xset` are out of scope.
 Linux sessions inhibit lid-switch sleep, including `--no-display` sessions.
+
+### Windows
+
+Windows uses Windows PowerShell to call `SetThreadExecutionState`, preventing system and display sleep while the child PowerShell process is alive.
+
 On Windows, `--no-display` omits `ES_DISPLAY_REQUIRED`, so the system stays awake while the display may sleep. The interactive picker is not available on Windows yet; running `wake` starts an indefinite session.
 
 ## Install

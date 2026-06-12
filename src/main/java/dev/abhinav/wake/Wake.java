@@ -23,6 +23,8 @@ public final class Wake {
     static final Path STATE_FILE = STATE_DIR.resolve("session.properties");
     static final String VERSION = "0.3.0";
     static final Platform PLATFORM = Platform.detect();
+    private static final String MAC_LID_CLOSE_NOTE =
+            "note: closing the lid still sleeps the mac — macOS forced sleep can't be blocked by user apps";
 
     public static void main(String[] args) {
         try {
@@ -237,6 +239,9 @@ public final class Wake {
         System.out.printf("  trigger : %s (%s)%n", s.trigger, s.detail);
         System.out.printf("  started : %s%n", startsAt);
         System.out.printf("  ends    : %s%n", endsAt);
+        if (PLATFORM instanceof MacPlatform) {
+            System.out.println(MAC_LID_CLOSE_NOTE);
+        }
     }
 
     static long spawnDetached(List<String> cmd) throws IOException {
@@ -350,6 +355,7 @@ public final class Wake {
                 platforms:
                   macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
                   Windows uses PowerShell + SetThreadExecutionState
+                  note: closing the lid still sleeps the mac — macOS forced sleep can't be blocked by user apps
 
                 interactive:
                   wake                       open the picker on macOS/Linux; on Windows, start indefinitely
