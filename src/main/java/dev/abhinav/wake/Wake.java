@@ -14,13 +14,14 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 public final class Wake {
 
-    static final Path STATE_DIR = Path.of(System.getProperty("user.home"), ".local/state/wake");
+    static final Path STATE_DIR = stateDir();
     static final Path STATE_FILE = STATE_DIR.resolve("session.properties");
-    static final String VERSION = "0.2.0";
+    static final String VERSION = "0.3.0";
     static final Platform PLATFORM = Platform.detect();
 
     public static void main(String[] args) {
@@ -49,7 +50,7 @@ public final class Wake {
             start(args);
             return;
         }
-        if (System.console() != null) {
+        if (System.console() != null && PLATFORM.supportsInteractive()) {
             Interactive.run();
         } else {
             start(new String[0]);
@@ -220,10 +221,7 @@ public final class Wake {
             return;
         }
         try {
-            new ProcessBuilder("/bin/kill", "-TERM", String.valueOf(s.pid))
-                    .redirectError(ProcessBuilder.Redirect.DISCARD)
-                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                    .start().waitFor();
+            ProcessHandle.of(s.pid).ifPresent(ProcessHandle::destroy);
         } catch (Exception ignored) {}
         Thread.sleep(200);
         Files.deleteIfExists(STATE_FILE);
@@ -247,17 +245,16 @@ public final class Wake {
 
     static Process spawnDetachedProcess(List<String> cmd) throws IOException {
         ProcessBuilder pb = new ProcessBuilder(cmd);
-        File devnull = new File("/dev/null");
-        pb.redirectInput(ProcessBuilder.Redirect.from(devnull));
-        pb.redirectOutput(ProcessBuilder.Redirect.to(devnull));
-        pb.redirectError(ProcessBuilder.Redirect.to(devnull));
+        pb.redirectInput(ProcessBuilder.Redirect.from(PLATFORM.devNull()));
+        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+        pb.redirectError(ProcessBuilder.Redirect.DISCARD);
         return pb.start();
     }
 
     static List<String> selfCommand() {
         ProcessHandle.Info info = ProcessHandle.current().info();
         String cmd = info.command().orElse(null);
-        if (cmd != null && !cmd.endsWith("/java") && !cmd.equals("java")) {
+        if (cmd != null && !isJavaCommand(cmd)) {
             return new ArrayList<>(List.of(cmd));
         }
         String jarPath;
@@ -267,6 +264,23 @@ public final class Wake {
             throw new RuntimeException("can't determine jar path", e);
         }
         return new ArrayList<>(List.of(cmd != null ? cmd : "java", "-jar", jarPath));
+    }
+
+    private static Path stateDir() {
+        String override = System.getenv("WAKE_STATE_DIR");
+        if (override != null && !override.isBlank()) return Path.of(override);
+        return Path.of(System.getProperty("user.home"), ".local/state/wake");
+    }
+
+    private static boolean isJavaCommand(String cmd) {
+        Path fileName = Path.of(cmd).getFileName();
+        if (fileName == null) return false;
+        String name = fileName.toString();
+        int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (slash >= 0) name = name.substring(slash + 1);
+        name = name.toLowerCase(Locale.ROOT);
+        if (name.endsWith(".exe")) name = name.substring(0, name.length() - 4);
+        return name.equals("java");
     }
 
     static boolean isAlive(long pid) {
@@ -334,10 +348,11 @@ public final class Wake {
                 wake — keep your machine awake from the CLI
 
                 platforms:
-                  macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd
+                  macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
+                  Windows uses PowerShell + SetThreadExecutionState
 
                 interactive:
-                  wake                       open the picker (when run in a terminal)
+                  wake                       open the picker on macOS/Linux; on Windows, start indefinitely
 
                 direct:
                   wake forever               stay awake indefinitely (no menu)
@@ -358,7 +373,7 @@ public final class Wake {
                   maximum: 30d
 
                 state file:
-                  ~/.local/state/wake/session.properties
+                  ~/.local/state/wake/session.properties (override dir with WAKE_STATE_DIR)
                 """);
     }
 

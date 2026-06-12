@@ -1,6 +1,5 @@
 package dev.abhinav.wake;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Instant;
@@ -35,10 +34,9 @@ final class Supervisor {
         }));
 
         ProcessBuilder keepAwake = new ProcessBuilder(Wake.PLATFORM.keepAwakeCommand(noDisplay, null, null));
-        File devnull = new File("/dev/null");
-        keepAwake.redirectInput(ProcessBuilder.Redirect.from(devnull));
-        keepAwake.redirectOutput(ProcessBuilder.Redirect.to(devnull));
-        keepAwake.redirectError(ProcessBuilder.Redirect.to(devnull));
+        keepAwake.redirectInput(ProcessBuilder.Redirect.from(Wake.PLATFORM.devNull()));
+        keepAwake.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+        keepAwake.redirectError(ProcessBuilder.Redirect.DISCARD);
         Process keepAwakeProc = keepAwake.start();
         keepAwakeProcRef.set(keepAwakeProc);
 
