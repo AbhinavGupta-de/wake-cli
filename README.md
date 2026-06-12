@@ -1,6 +1,6 @@
 # wake
 
-A command-line macOS awake controller, like Amphetamine or Caffeine for the terminal.
+A command-line awake controller for macOS and Linux.
 
 ## Features
 
@@ -19,7 +19,7 @@ A command-line macOS awake controller, like Amphetamine or Caffeine for the term
 Running `wake` in an interactive terminal opens the picker:
 
 ```text
-  ☕ wake  — keep your mac awake
+  ☕ wake  — keep your machine awake
 
   ○ no active session
 
@@ -27,7 +27,7 @@ Running `wake` in an interactive terminal opens the picker:
     For a duration…     1h, 30m, 1h30m, 90s
     Until clock time…   stay awake until HH:MM
     Until battery %…    until charge hits N%
-    While app running…  watch a running mac app
+    While app running…  watch a running app/process
     While PID alive…    watch a specific process id
     ─────────────────────────
     Quit
@@ -35,19 +35,40 @@ Running `wake` in an interactive terminal opens the picker:
   ↑↓/jk navigate · ↵ select · d display-sleep [off] · q quit
 ```
 
+## Supported Platforms
+
+- macOS: uses `caffeinate` for sleep assertions and `pmset` for battery state.
+- Linux: uses `systemd-inhibit`; requires systemd >= 190. Battery sessions read `/sys/class/power_supply`.
+
+On Linux, display-sleep prevention is limited to idle/sleep inhibitors. Desktop-environment display blanking controls such as X11 `xset` are out of scope.
+Linux sessions inhibit lid-switch sleep, including `--no-display` sessions.
+
 ## Install
 
 Prerequisites:
 
-- macOS.
+- macOS, or Linux with systemd >= 190.
 - GraalVM JDK 21 or newer. The current native build uses GraalVM JDK 25.
+- Maven.
 
 Build from source:
 
 ```sh
 git clone git@github.com:AbhinavGupta-de/wake-cli.git
 cd wake-cli
+```
+
+macOS:
+
+```sh
 JAVA_HOME=<graalvm-home> bash bin/build.sh
+```
+
+Linux:
+
+```sh
+export JAVA_HOME=<graalvm-home>
+bash bin/build.sh
 ```
 
 The build writes the native binary to `target/wake`.
@@ -91,7 +112,10 @@ wake: no active session
 
 ## Requirements
 
-`wake` is macOS-only. It uses system tools available on macOS: `caffeinate`, `pmset`, `stty`, and `pgrep`.
+`wake` uses platform tools instead of a background daemon:
+
+- macOS: `caffeinate`, `pmset`, `stty`, and `pgrep`.
+- Linux: `systemd-inhibit`, GNU coreutils `sleep` and `tail` (not BusyBox), `stty`, `pgrep`, and sysfs power-supply files for battery triggers.
 
 ## License
 
