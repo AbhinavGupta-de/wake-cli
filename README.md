@@ -1,10 +1,10 @@
 # wake
 
-A command-line awake controller for macOS and Linux.
+A command-line awake controller for macOS, Linux, and Windows.
 
 ## Features
 
-- Interactive picker for starting, inspecting, and stopping sessions.
+- Interactive picker for starting, inspecting, and stopping sessions on macOS/Linux.
 - Indefinite sessions with `wake forever`.
 - Timed durations such as `wake 1h`, `wake 30m`, and `wake 1h30m`.
 - Clock-based sessions with `wake --until HH:MM`.
@@ -16,7 +16,7 @@ A command-line awake controller for macOS and Linux.
 
 ## Demo
 
-Running `wake` in an interactive terminal opens the picker:
+On macOS/Linux, running `wake` in an interactive terminal opens the picker:
 
 ```text
   ☕ wake  — keep your machine awake
@@ -37,17 +37,34 @@ Running `wake` in an interactive terminal opens the picker:
 
 ## Supported Platforms
 
-- macOS: uses `caffeinate` for sleep assertions and `pmset` for battery state.
-- Linux: uses `systemd-inhibit`; requires systemd >= 190. Battery sessions read `/sys/class/power_supply`.
+### macOS
+
+macOS uses `caffeinate` for sleep assertions and `pmset` for battery state.
+
+#### Limitations
+
+`wake` blocks idle sleep on macOS; it cannot block forced sleep. Closing the lid or choosing Sleep from the Apple menu still sleeps the Mac. Amphetamine has the same macOS constraint. The root-only workaround is `sudo pmset disablesleep 1`, which is deliberately not built in.
+
+This differs from Linux, where systemd can inhibit lid-switch sleep.
+
+### Linux
+
+Linux uses `systemd-inhibit`; requires systemd >= 190. Battery sessions read `/sys/class/power_supply`.
 
 On Linux, display-sleep prevention is limited to idle/sleep inhibitors. Desktop-environment display blanking controls such as X11 `xset` are out of scope.
-Linux sessions inhibit lid-switch sleep, including `--no-display` sessions.
+Lid-switch inhibition is controlled by systemd-logind policy. Polkit grants it only in privileged or local desktop sessions, so `wake` automatically degrades to idle/sleep inhibition when lid-switch locks are unavailable and prints a note in the start confirmation.
+
+### Windows
+
+Windows uses Windows PowerShell to call `SetThreadExecutionState`, preventing system and display sleep while the child PowerShell process is alive.
+
+On Windows, `--no-display` omits `ES_DISPLAY_REQUIRED`, so the system stays awake while the display may sleep. The interactive picker is not available on Windows yet; running `wake` starts an indefinite session.
 
 ## Install
 
 Prerequisites:
 
-- macOS, or Linux with systemd >= 190.
+- macOS, Linux with systemd >= 190, or Windows with Windows PowerShell.
 - GraalVM JDK 21 or newer. The current native build uses GraalVM JDK 25.
 - Maven.
 
@@ -71,7 +88,17 @@ export JAVA_HOME=<graalvm-home>
 bash bin/build.sh
 ```
 
-The build writes the native binary to `target/wake`.
+Windows:
+
+```powershell
+$env:JAVA_HOME = "<graalvm-home>"
+mvn -q -DskipTests package
+& "$env:JAVA_HOME\bin\native-image" --no-fallback -O2 -jar target\wake.jar target\wake.exe
+```
+
+`bin/build.sh` is for macOS/Linux. Windows users can build with the commands above or download a prebuilt release binary.
+
+The native build writes `target/wake` on macOS/Linux or `target\wake.exe` on Windows.
 
 Add it to your shell:
 
@@ -104,7 +131,7 @@ Example output from the current binary:
 
 ```text
 $ wake --version
-wake 0.1.0
+wake 0.2.0
 
 $ wake status
 wake: no active session
@@ -116,6 +143,10 @@ wake: no active session
 
 - macOS: `caffeinate`, `pmset`, `stty`, and `pgrep`.
 - Linux: `systemd-inhibit`, GNU coreutils `sleep` and `tail` (not BusyBox), `stty`, `pgrep`, and sysfs power-supply files for battery triggers.
+- Windows: Windows PowerShell, `tasklist`, and CIM `Win32_Battery` for battery triggers.
+
+Session state is stored under `~/.local/state/wake/session.properties` on every platform, including Windows.
+Set `WAKE_STATE_DIR` to override the state directory; `wake` writes `session.properties` inside that directory.
 
 ## License
 

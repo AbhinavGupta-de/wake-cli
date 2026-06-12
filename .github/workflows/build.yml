@@ -1,0 +1,316 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: wake-linux-x64
+          - os: macos-latest
+            artifact_name: wake-macos-arm64
+          - os: windows-latest
+            artifact_name: wake-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '25'
+          distribution: graalvm
+          native-image-job-reports: 'true'
+
+      - name: Set up MSVC for native-image
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build jar
+        run: mvn -B -DskipTests package
+
+      - name: Build native image
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          native-image --no-fallback -O2 -jar target/wake.jar target/wake
+          chmod +x target/wake
+
+      - name: Build native image
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          native-image --no-fallback -O2 -jar target\wake.jar target\wake
+          if (-not (Test-Path -LiteralPath 'target\wake.exe')) {
+            Get-ChildItem -LiteralPath target
+            throw 'native-image did not produce target\wake.exe'
+          }
+          Get-ChildItem -LiteralPath target
+
+      - name: Smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export WAKE_STATE_DIR="$RUNNER_TEMP/wake-state"
+          mkdir -p "$WAKE_STATE_DIR"
+
+          wake_bin="$GITHUB_WORKSPACE/target/wake"
+
+          cleanup() {
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo -E "$wake_bin" stop >/dev/null 2>&1 || true
+            else
+              "$wake_bin" stop >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          wake_command() {
+            if [[ "${WAKE_USE_SUDO:-0}" == "1" ]]; then
+              sudo -E "$wake_bin" "$@"
+            else
+              "$wake_bin" "$@"
+            fi
+          }
+
+          print_failure_output() {
+            local output="$1"
+            echo "captured output:" >&2
+            if [[ -n "$output" ]]; then
+              printf '%s\n' "$output" >&2
+            else
+              echo "<empty>" >&2
+            fi
+          }
+
+          run_ok() {
+            local output status
+            set +e
+            output="$(wake_command "$@" 2>&1)"
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [[ "$status" -ne 0 ]]; then
+              echo "expected success from wake $*, got $status" >&2
+              print_failure_output "$output"
+              exit 1
+            fi
+          }
+
+          run_fail() {
+            local expected="${1:-}"
+            shift || true
+            local output status
+            set +e
+            output="$(wake_command "$@" 2>&1)"
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [[ "$status" -eq 0 ]]; then
+              echo "expected failure from: wake $*" >&2
+              print_failure_output "$output"
+              exit 1
+            fi
+            if [[ -n "$expected" && "$status" -ne "$expected" ]]; then
+              echo "expected exit $expected from wake $*, got $status" >&2
+              print_failure_output "$output"
+              exit 1
+            fi
+          }
+
+          run_lifecycle_ok() {
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              WAKE_USE_SUDO=1 run_ok "$@"
+            else
+              run_ok "$@"
+            fi
+          }
+
+          run_lifecycle_fail() {
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              WAKE_USE_SUDO=1 run_fail "$@"
+            else
+              run_fail "$@"
+            fi
+          }
+
+          run_ok --version | grep -F "wake "
+          run_ok --help | grep -F "wake --until-charge N"
+
+          conflict_output="$(run_fail 2 --until-charge 80 --while-pid 1)"
+          grep -F "conflicting triggers" <<<"$conflict_output"
+
+          battery_output="$(run_fail "" --until-charge 80)"
+          grep -F "wake:" <<<"$battery_output"
+          if grep -E "Exception|at dev\\.abhinav\\.wake" <<<"$battery_output"; then
+            echo "battery failure printed an unhandled exception" >&2
+            exit 1
+          fi
+
+          run_lifecycle_ok forever --no-display | grep -F "session active"
+          run_lifecycle_ok status | grep -F "session active"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sleep 2
+            sudo systemd-inhibit --list --no-pager | tee "$RUNNER_TEMP/wake-inhibitors.txt"
+            grep -F "wake" "$RUNNER_TEMP/wake-inhibitors.txt"
+          fi
+          duplicate_output="$(run_lifecycle_fail "" 5s)"
+          grep -F "session already active" <<<"$duplicate_output"
+          run_lifecycle_ok stop | grep -F "stopped"
+
+          run_lifecycle_ok 5s | grep -F "session active"
+          run_lifecycle_ok status | grep -F "session active"
+          run_lifecycle_ok stop | grep -F "stopped"
+
+      - name: Smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $env:WAKE_STATE_DIR = Join-Path $env:RUNNER_TEMP 'wake-state'
+          New-Item -ItemType Directory -Force -Path $env:WAKE_STATE_DIR | Out-Null
+
+          $wake = Join-Path $env:GITHUB_WORKSPACE 'target\wake.exe'
+
+          function Invoke-Wake {
+            param([string[]] $WakeArgs)
+            $output = & $wake @WakeArgs 2>&1
+            [pscustomobject] @{
+              Code = $LASTEXITCODE
+              Output = ($output -join "`n")
+            }
+          }
+
+          function Format-CapturedOutput {
+            param([string] $Text)
+            if ([string]::IsNullOrEmpty($Text)) {
+              return '<empty>'
+            }
+            return $Text
+          }
+
+          function Assert-Success {
+            param([string[]] $WakeArgs)
+            $result = Invoke-Wake $WakeArgs
+            Write-Host $result.Output
+            if ($result.Code -ne 0) {
+              throw "wake $($WakeArgs -join ' ') failed with $($result.Code). Captured output:`n$(Format-CapturedOutput $result.Output)"
+            }
+            return $result.Output
+          }
+
+          function Assert-Failure {
+            param(
+              [string[]] $WakeArgs,
+              [int] $ExpectedCode = -1
+            )
+            $result = Invoke-Wake $WakeArgs
+            Write-Host $result.Output
+            if ($result.Code -eq 0) {
+              throw "expected failure from wake $($WakeArgs -join ' '). Captured output:`n$(Format-CapturedOutput $result.Output)"
+            }
+            if ($ExpectedCode -ge 0 -and $result.Code -ne $ExpectedCode) {
+              throw "expected exit $ExpectedCode from wake $($WakeArgs -join ' '), got $($result.Code). Captured output:`n$(Format-CapturedOutput $result.Output)"
+            }
+            return $result
+          }
+
+          function Assert-Contains {
+            param(
+              [string] $Text,
+              [string] $Needle
+            )
+            if (-not $Text.Contains($Needle)) {
+              throw "expected output to contain '$Needle', got: $Text"
+            }
+          }
+
+          try {
+            Assert-Contains (Assert-Success -WakeArgs @('--version')) 'wake '
+            Assert-Contains (Assert-Success -WakeArgs @('--help')) 'wake --until-charge N'
+
+            $conflict = Assert-Failure -WakeArgs @('--until-charge', '80', '--while-pid', '1') -ExpectedCode 2
+            Assert-Contains $conflict.Output 'conflicting triggers'
+
+            $battery = Assert-Failure -WakeArgs @('--until-charge', '80')
+            Assert-Contains $battery.Output 'wake:'
+            if ($battery.Output -match 'Exception|at dev\.abhinav\.wake') {
+              throw 'battery failure printed an unhandled exception'
+            }
+
+            Assert-Contains (Assert-Success -WakeArgs @('forever', '--no-display')) 'session active'
+            Assert-Contains (Assert-Success -WakeArgs @('status')) 'session active'
+            $duplicate = Assert-Failure -WakeArgs @('5s')
+            Assert-Contains $duplicate.Output 'session already active'
+            Assert-Contains (Assert-Success -WakeArgs @('stop')) 'stopped'
+
+            Assert-Contains (Assert-Success -WakeArgs @('5s')) 'session active'
+            Assert-Contains (Assert-Success -WakeArgs @('status')) 'session active'
+            Assert-Contains (Assert-Success -WakeArgs @('stop')) 'stopped'
+          } finally {
+            & $wake stop *> $null
+          }
+
+      - name: Prepare artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/wake "dist/${{ matrix.artifact_name }}"
+
+      - name: Prepare artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\wake.exe "dist\${{ matrix.artifact_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  attach-to-release:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Attach artifacts to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            dist/wake-macos-arm64/wake-macos-arm64
+            dist/wake-linux-x64/wake-linux-x64
+            dist/wake-windows-x64.exe/wake-windows-x64.exe
+          )
+          gh release upload "${{ github.event.release.tag_name }}" "${files[@]}" --clobber

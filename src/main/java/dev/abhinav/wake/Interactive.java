@@ -4,6 +4,8 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
@@ -32,8 +34,10 @@ final class Interactive {
     private static final int KEY_IGNORE = 0;
 
     private boolean noDisplay = false;
+    private boolean showDetail = false;
     private int selected = 0;
     private boolean rawMode = false;
+    private boolean cleaned = false;
     private String savedTty;
 
     static void run() throws Exception {
@@ -66,14 +70,19 @@ final class Interactive {
             } else if (key == '\r' || key == '\n') {
                 MenuItem it = items.get(selected);
                 if (it.separator) continue;
-                cleanup();
+                if (it.exitAfter) {
+                    cleanup();
+                    it.action.accept(this);
+                    return;
+                }
                 it.action.accept(this);
-                return;
             }
         }
     }
 
-    private void cleanup() {
+    private synchronized void cleanup() {
+        if (cleaned) return;
+        cleaned = true;
         try {
             System.out.print(SHOW_CURSOR + ALT_OFF + RESET);
             System.out.flush();
@@ -89,11 +98,12 @@ final class Interactive {
         final String hint;
         final Consumer<Interactive> action;
         final boolean separator;
-        MenuItem(String label, String hint, Consumer<Interactive> action) {
-            this.label = label; this.hint = hint; this.action = action; this.separator = false;
+        final boolean exitAfter;
+        MenuItem(String label, String hint, Consumer<Interactive> action, boolean exitAfter) {
+            this.label = label; this.hint = hint; this.action = action; this.separator = false; this.exitAfter = exitAfter;
         }
         private MenuItem() {
-            this.label = ""; this.hint = ""; this.action = i -> {}; this.separator = true;
+            this.label = ""; this.hint = ""; this.action = i -> {}; this.separator = true; this.exitAfter = false;
         }
         static MenuItem sep() { return new MenuItem(); }
     }
@@ -102,25 +112,25 @@ final class Interactive {
         List<MenuItem> items = new ArrayList<>();
         if (existing != null) {
             items.add(new MenuItem("Show status",  "view session details",
-                    i -> i.runAction(() -> Wake.status())));
+                    i -> i.showDetail = !i.showDetail, false));
             items.add(new MenuItem("Stop session", "end the active session",
-                    i -> i.runAction(() -> Wake.stop())));
+                    i -> i.runAction(() -> Wake.stop()), true));
         } else {
             items.add(new MenuItem("Indefinite",          "stay awake forever",
-                    i -> i.startWith()));
+                    i -> i.startWith(), true));
             items.add(new MenuItem("For a duration…",     "1h, 30m, 1h30m, 90s",
-                    i -> i.askAndStart("Duration (e.g. 1h30m, 90s)", null)));
+                    i -> i.askAndStart("Duration (e.g. 1h30m, 90s)", null), true));
             items.add(new MenuItem("Until clock time…",   "stay awake until HH:MM",
-                    i -> i.askAndStart("Until clock time (HH:MM)", "--until")));
+                    i -> i.askAndStart("Until clock time (HH:MM)", "--until"), true));
             items.add(new MenuItem("Until battery %…",    "until charge hits N%",
-                    i -> i.askAndStart("Target battery percent (1-100)", "--until-charge")));
+                    i -> i.askAndStart("Target battery percent (1-100)", "--until-charge"), true));
             items.add(new MenuItem("While app running…",  "watch a running app/process",
-                    i -> i.askAndStart("App/process name", "--while-app")));
+                    i -> i.askAndStart("App/process name", "--while-app"), true));
             items.add(new MenuItem("While PID alive…",    "watch a specific process id",
-                    i -> i.askAndStart("PID to watch", "--while-pid")));
+                    i -> i.askAndStart("PID to watch", "--while-pid"), true));
         }
         items.add(MenuItem.sep());
-        items.add(new MenuItem("Quit", "exit without changes", i -> {}));
+        items.add(new MenuItem("Quit", "exit without changes", i -> {}, true));
         return items;
     }
 
@@ -158,7 +168,11 @@ final class Interactive {
                 long rem = Math.max(0, java.time.Duration.between(Instant.now(), existing.endsAt).getSeconds());
                 sb.append("   ").append(DIM).append('(').append(Wake.prettyDuration(rem)).append(" left)").append(RESET);
             }
-            sb.append("\n\n");
+            sb.append('\n');
+            if (showDetail) {
+                appendSessionDetail(sb, existing);
+            }
+            sb.append('\n');
         } else {
             sb.append("  ").append(FG_GREY).append("○ no active session").append(RESET).append("\n\n");
         }
@@ -188,6 +202,19 @@ final class Interactive {
 
         System.out.print(sb);
         System.out.flush();
+    }
+
+    private void appendSessionDetail(StringBuilder sb, Session existing) {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
+        long elapsedSec = java.time.Duration.between(existing.startedAt, Instant.now()).getSeconds();
+        String remaining = existing.endsAt == null
+                ? "—"
+                : Wake.prettyDuration(Math.max(0, java.time.Duration.between(Instant.now(), existing.endsAt).getSeconds()));
+        sb.append("    mode      : ").append(existing.mode).append('\n');
+        sb.append("    trigger   : ").append(existing.trigger).append(" (").append(existing.detail).append(")\n");
+        sb.append("    started   : ").append(fmt.format(existing.startedAt))
+          .append(" (").append(Wake.prettyDuration(elapsedSec)).append(" ago)\n");
+        sb.append("    remaining : ").append(remaining).append('\n');
     }
 
     private void startWith(String... extra) {

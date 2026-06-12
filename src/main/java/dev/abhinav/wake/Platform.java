@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 
 interface Platform {
@@ -23,11 +24,27 @@ interface Platform {
     /** Basenames considered ours for the Session identity check. */
     Set<String> expectedCommandBasenames();
 
+    /** Whether no-args console launch can use the interactive picker. */
+    default boolean supportsInteractive() {
+        return true;
+    }
+
+    /** Note to print after the start confirmation for this invocation, if any. */
+    default Optional<String> startNote() {
+        return Optional.empty();
+    }
+
+    /** Platform null input device for detached children. */
+    default File devNull() {
+        return new File("/dev/null");
+    }
+
     static Platform detect() {
         String osName = System.getProperty("os.name", "unknown");
         String lower = osName.toLowerCase(Locale.ROOT);
         if (lower.contains("mac") || lower.contains("darwin")) return new MacPlatform();
         if (lower.contains("linux")) return new LinuxPlatform();
+        if (lower.contains("windows")) return new WindowsPlatform();
         System.err.println("wake: unsupported platform: " + osName);
         System.exit(1);
         throw new IllegalStateException("unsupported platform: " + osName);
