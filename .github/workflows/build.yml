@@ -72,19 +72,42 @@ jobs:
           wake_bin="$GITHUB_WORKSPACE/target/wake"
 
           cleanup() {
-            "$wake_bin" stop >/dev/null 2>&1 || true
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo -E "$wake_bin" stop >/dev/null 2>&1 || true
+            else
+              "$wake_bin" stop >/dev/null 2>&1 || true
+            fi
           }
           trap cleanup EXIT
+
+          wake_command() {
+            if [[ "${WAKE_USE_SUDO:-0}" == "1" ]]; then
+              sudo -E "$wake_bin" "$@"
+            else
+              "$wake_bin" "$@"
+            fi
+          }
+
+          print_failure_output() {
+            local output="$1"
+            echo "captured output:" >&2
+            if [[ -n "$output" ]]; then
+              printf '%s\n' "$output" >&2
+            else
+              echo "<empty>" >&2
+            fi
+          }
 
           run_ok() {
             local output status
             set +e
-            output="$("$wake_bin" "$@" 2>&1)"
+            output="$(wake_command "$@" 2>&1)"
             status=$?
             set -e
             printf '%s\n' "$output"
             if [[ "$status" -ne 0 ]]; then
               echo "expected success from wake $*, got $status" >&2
+              print_failure_output "$output"
               exit 1
             fi
           }
@@ -94,17 +117,35 @@ jobs:
             shift || true
             local output status
             set +e
-            output="$("$wake_bin" "$@" 2>&1)"
+            output="$(wake_command "$@" 2>&1)"
             status=$?
             set -e
             printf '%s\n' "$output"
             if [[ "$status" -eq 0 ]]; then
               echo "expected failure from: wake $*" >&2
+              print_failure_output "$output"
               exit 1
             fi
             if [[ -n "$expected" && "$status" -ne "$expected" ]]; then
               echo "expected exit $expected from wake $*, got $status" >&2
+              print_failure_output "$output"
               exit 1
+            fi
+          }
+
+          run_lifecycle_ok() {
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              WAKE_USE_SUDO=1 run_ok "$@"
+            else
+              run_ok "$@"
+            fi
+          }
+
+          run_lifecycle_fail() {
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              WAKE_USE_SUDO=1 run_fail "$@"
+            else
+              run_fail "$@"
             fi
           }
 
@@ -121,20 +162,20 @@ jobs:
             exit 1
           fi
 
-          run_ok forever --no-display | grep -F "session active"
-          run_ok status | grep -F "session active"
+          run_lifecycle_ok forever --no-display | grep -F "session active"
+          run_lifecycle_ok status | grep -F "session active"
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             sleep 2
-            systemd-inhibit --list --no-pager | tee "$RUNNER_TEMP/wake-inhibitors.txt"
+            sudo systemd-inhibit --list --no-pager | tee "$RUNNER_TEMP/wake-inhibitors.txt"
             grep -F "wake" "$RUNNER_TEMP/wake-inhibitors.txt"
           fi
-          duplicate_output="$(run_fail "" 5s)"
+          duplicate_output="$(run_lifecycle_fail "" 5s)"
           grep -F "session already active" <<<"$duplicate_output"
-          run_ok stop | grep -F "stopped"
+          run_lifecycle_ok stop | grep -F "stopped"
 
-          run_ok 5s | grep -F "session active"
-          run_ok status | grep -F "session active"
-          run_ok stop | grep -F "stopped"
+          run_lifecycle_ok 5s | grep -F "session active"
+          run_lifecycle_ok status | grep -F "session active"
+          run_lifecycle_ok stop | grep -F "stopped"
 
       - name: Smoke test
         if: runner.os == 'Windows'
@@ -157,12 +198,20 @@ jobs:
             }
           }
 
+          function Format-CapturedOutput {
+            param([string] $Text)
+            if ([string]::IsNullOrEmpty($Text)) {
+              return '<empty>'
+            }
+            return $Text
+          }
+
           function Assert-Success {
             param([string[]] $WakeArgs)
             $result = Invoke-Wake $WakeArgs
             Write-Host $result.Output
             if ($result.Code -ne 0) {
-              throw "wake $($WakeArgs -join ' ') failed with $($result.Code): $($result.Output)"
+              throw "wake $($WakeArgs -join ' ') failed with $($result.Code). Captured output:`n$(Format-CapturedOutput $result.Output)"
             }
             return $result.Output
           }
@@ -175,10 +224,10 @@ jobs:
             $result = Invoke-Wake $WakeArgs
             Write-Host $result.Output
             if ($result.Code -eq 0) {
-              throw "expected failure from wake $($WakeArgs -join ' ')"
+              throw "expected failure from wake $($WakeArgs -join ' '). Captured output:`n$(Format-CapturedOutput $result.Output)"
             }
             if ($ExpectedCode -ge 0 -and $result.Code -ne $ExpectedCode) {
-              throw "expected exit $ExpectedCode from wake $($WakeArgs -join ' '), got $($result.Code)"
+              throw "expected exit $ExpectedCode from wake $($WakeArgs -join ' '), got $($result.Code). Captured output:`n$(Format-CapturedOutput $result.Output)"
             }
             return $result
           }

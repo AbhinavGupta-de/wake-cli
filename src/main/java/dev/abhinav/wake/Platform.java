@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 
 interface Platform {
@@ -26,6 +27,11 @@ interface Platform {
     /** Whether no-args console launch can use the interactive picker. */
     default boolean supportsInteractive() {
         return true;
+    }
+
+    /** Note to print after the start confirmation for this invocation, if any. */
+    default Optional<String> startNote() {
+        return Optional.empty();
     }
 
     /** Platform null input device for detached children. */

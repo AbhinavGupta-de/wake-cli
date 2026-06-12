@@ -7,18 +7,38 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 
 final class LinuxPlatform implements Platform {
     private static final Path POWER_SUPPLY = Path.of("/sys/class/power_supply");
     private static final Set<String> EXPECTED_COMMANDS = Set.of("systemd-inhibit", "sleep", "tail", "wake");
+    private static final List<String> DISPLAY_SYSTEM_INHIBITORS =
+            List.of("idle:sleep:handle-lid-switch", "idle:sleep", "sleep");
+    private static final List<String> SYSTEM_ONLY_INHIBITORS =
+            List.of("sleep:handle-lid-switch", "sleep");
+    private static final String INHIBIT_DENIED_MESSAGE =
+            "systemd-inhibit cannot take inhibitor locks in this session (polkit denied) — try from a local desktop session or as root";
+
+    private final InhibitorProber inhibitorProber;
+    private String startNote;
+
+    LinuxPlatform() {
+        this(LinuxPlatform::probeInhibitor);
+    }
+
+    LinuxPlatform(InhibitorProber inhibitorProber) {
+        this.inhibitorProber = inhibitorProber;
+    }
 
     @Override
     public List<String> keepAwakeCommand(boolean noDisplay, Long timeoutSec, Long waitPid) {
         String systemdInhibit = Platform.resolveOnPath("systemd-inhibit",
                 "systemd-inhibit not found on PATH; wake requires systemd on Linux");
-        String what = noDisplay ? "sleep:handle-lid-switch" : "idle:sleep:handle-lid-switch";
+        InhibitorChoice choice = chooseInhibitorWhat(noDisplay, systemdInhibit, inhibitorProber);
+        String what = choice.what();
+        startNote = startNoteFor(choice);
         List<String> cmd = new ArrayList<>(List.of(
                 systemdInhibit,
                 "--what=" + what,
@@ -34,6 +54,11 @@ final class LinuxPlatform implements Platform {
             cmd.add(timeoutSec == null ? "infinity" : String.valueOf(timeoutSec));
         }
         return cmd;
+    }
+
+    @Override
+    public Optional<String> startNote() {
+        return Optional.ofNullable(startNote);
     }
 
     @Override
@@ -89,6 +114,48 @@ final class LinuxPlatform implements Platform {
     @Override
     public Set<String> expectedCommandBasenames() {
         return EXPECTED_COMMANDS;
+    }
+
+    static InhibitorChoice chooseInhibitorWhat(boolean noDisplay, String systemdInhibit, InhibitorProber prober) {
+        List<String> candidates = noDisplay ? SYSTEM_ONLY_INHIBITORS : DISPLAY_SYSTEM_INHIBITORS;
+        String requested = candidates.get(0);
+        for (String candidate : candidates) {
+            if (prober.canInhibit(systemdInhibit, candidate)) {
+                return new InhibitorChoice(requested, candidate);
+            }
+        }
+        throw new IllegalStateException(INHIBIT_DENIED_MESSAGE);
+    }
+
+    private static boolean probeInhibitor(String systemdInhibit, String what) {
+        ProcessBuilder pb = new ProcessBuilder(
+                systemdInhibit,
+                "--what=" + what,
+                "--who=wake",
+                "--why=probe",
+                "true");
+        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+        pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+        try {
+            Process p = pb.start();
+            return p.waitFor() == 0;
+        } catch (IOException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while probing systemd-inhibit");
+        }
+    }
+
+    private static String startNoteFor(InhibitorChoice choice) {
+        if (choice.requestedWhat().equals(choice.what())) return null;
+        if ("idle:sleep".equals(choice.what())) {
+            return "note: lid-switch inhibition unavailable in this session — idle/sleep inhibition active";
+        }
+        if ("sleep".equals(choice.what()) && choice.requestedWhat().contains("idle")) {
+            return "note: lid-switch and idle inhibition unavailable in this session — sleep inhibition active";
+        }
+        return "note: lid-switch inhibition unavailable in this session — sleep inhibition active";
     }
 
     private static String readTrimmed(Path path) throws IOException {
@@ -173,6 +240,13 @@ final class LinuxPlatform implements Platform {
     private static int clampPercent(int percent) {
         return Math.max(0, Math.min(100, percent));
     }
+
+    @FunctionalInterface
+    interface InhibitorProber {
+        boolean canInhibit(String systemdInhibit, String what);
+    }
+
+    record InhibitorChoice(String requestedWhat, String what) {}
 
     private record Battery(Integer capacity, Measurement measurement, String status) {}
     private record Measurement(long now, long full) {}

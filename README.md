@@ -52,7 +52,7 @@ This differs from Linux, where systemd can inhibit lid-switch sleep.
 Linux uses `systemd-inhibit`; requires systemd >= 190. Battery sessions read `/sys/class/power_supply`.
 
 On Linux, display-sleep prevention is limited to idle/sleep inhibitors. Desktop-environment display blanking controls such as X11 `xset` are out of scope.
-Linux sessions inhibit lid-switch sleep, including `--no-display` sessions.
+Lid-switch inhibition is controlled by systemd-logind policy. Polkit grants it only in privileged or local desktop sessions, so `wake` automatically degrades to idle/sleep inhibition when lid-switch locks are unavailable and prints a note in the start confirmation.
 
 ### Windows
 

@@ -4,12 +4,15 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 final class MacPlatform implements Platform {
     private static final String CAFFEINATE = "/usr/bin/caffeinate";
+    private static final String LID_CLOSE_NOTE =
+            "note: closing the lid still sleeps the mac — macOS forced sleep can't be blocked by user apps";
     private static final Pattern PCT = Pattern.compile("(\\d+)%");
     private static final Set<String> EXPECTED_COMMANDS = Set.of("caffeinate", "wake");
 
@@ -54,5 +57,10 @@ final class MacPlatform implements Platform {
     @Override
     public Set<String> expectedCommandBasenames() {
         return EXPECTED_COMMANDS;
+    }
+
+    @Override
+    public Optional<String> startNote() {
+        return Optional.of(LID_CLOSE_NOTE);
     }
 }
