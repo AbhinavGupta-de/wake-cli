@@ -21,8 +21,16 @@ public final class Wake {
 
     static final Path STATE_DIR = stateDir();
     static final Path STATE_FILE = STATE_DIR.resolve("session.properties");
-    static final String VERSION = "0.3.0";
+    static final String VERSION = "0.4.0";
     static final Platform PLATFORM = Platform.detect();
+    static final String PHASE_ENABLING = "enabling";
+    static final String PHASE_ACTIVE = "active";
+
+    interface DisableSleepOps {
+        int readDisableSleep() throws Exception;
+        boolean setDisableSleepNonInteractive(int value) throws Exception;
+        void setDisableSleepForeground(int value) throws Exception;
+    }
 
     public static void main(String[] args) {
         try {
@@ -46,10 +54,12 @@ public final class Wake {
                 case "stop" -> { stop(); return; }
                 case "forever", "indefinite" -> { startForever(args); return; }
                 case "__supervise_charge__" -> { Supervisor.runCharge(args); return; }
+                case "__supervise_lid__" -> { Supervisor.runLid(args); return; }
             }
             start(args);
             return;
         }
+        recoverStaleLidSessionForeground();
         if (System.console() != null && PLATFORM.supportsInteractive()) {
             Interactive.run();
         } else {
@@ -65,12 +75,14 @@ public final class Wake {
         String trigger = "indefinite";
         String triggerFlag = null;
         boolean noDisplay = false;
+        boolean evenLid = false;
 
         int i = 0;
         while (i < args.length) {
             String a = args[i];
             switch (a) {
                 case "--no-display" -> { noDisplay = true; i++; }
+                case "--even-lid" -> { evenLid = true; i++; }
                 case "-t", "--for" -> {
                     if (i + 1 >= args.length) throw new UsageError("missing value for " + a);
                     triggerFlag = claimTrigger(triggerFlag, a);
@@ -116,6 +128,12 @@ public final class Wake {
                     trigger = "while-app";
                     i++;
                 }
+                case "forever", "indefinite" -> {
+                    triggerFlag = claimTrigger(triggerFlag, a);
+                    triggerDetail = "indefinite";
+                    trigger = "indefinite";
+                    i++;
+                }
                 default -> {
                     if (a.startsWith("-")) throw new UsageError("unknown flag: " + a);
                     triggerFlag = claimTrigger(triggerFlag, "duration");
@@ -127,8 +145,13 @@ public final class Wake {
             }
         }
 
+        if (evenLid && !PLATFORM.supportsEvenLid()) {
+            throw new UsageError(evenLidUnsupportedMessage());
+        }
+
         FileLock lock = Session.acquireLock();
         try {
+            recoverStaleLidSessionUnlocked();
             Session existing = Session.readIfAlive(true);
             if (existing != null) {
                 System.err.println("wake: session already active (pid " + existing.pid + ", " + existing.trigger + " " + existing.detail + ")");
@@ -139,7 +162,16 @@ public final class Wake {
             String mode = noDisplay ? "system-only" : "display+system";
 
             if (chargeTarget != null) {
+                if (evenLid) {
+                    startLidSupervisor(trigger, triggerDetail, mode, noDisplay, timeoutSec, waitPid, chargeTarget);
+                    return;
+                }
                 startSupervisor(chargeTarget, mode, noDisplay);
+                return;
+            }
+
+            if (evenLid) {
+                startLidSupervisor(trigger, triggerDetail, mode, noDisplay, timeoutSec, waitPid, null);
                 return;
             }
 
@@ -169,6 +201,92 @@ public final class Wake {
         }
     }
 
+    static void startLidSupervisor(String trigger, String detail, String mode, boolean noDisplay,
+                                   Long timeoutSec, Long waitPid, Integer chargeTarget) throws Exception {
+        String supervisorDetail = detail;
+        if (chargeTarget != null) {
+            Supervisor.BatteryStatus status = Supervisor.readBatteryStatus();
+            Supervisor.ChargePlan plan = Supervisor.planCharge(chargeTarget, status);
+            if (plan.alreadyMet) {
+                System.out.printf("wake: battery already at %d%%; target %d%% reached%n", status.percent, chargeTarget);
+                return;
+            }
+            supervisorDetail = chargeTarget + "% (was " + status.percent + "%, "
+                    + (plan.chargingUp ? "charging up" : "discharging down") + ")";
+        }
+
+        int priorDisableSleep = PLATFORM.readDisableSleep();
+        ensureSudoForEvenLid();
+
+        boolean disableSleepMayBeChanged = false;
+        boolean recoveryRecordWritten = false;
+        boolean supervisorOwnsSetting = false;
+        Process supervisor = null;
+        try {
+            writeLidStartupRecoveryRecord(trigger, supervisorDetail, mode, timeoutSec, priorDisableSleep);
+            recoveryRecordWritten = true;
+            PLATFORM.setDisableSleepForeground(1);
+            disableSleepMayBeChanged = true;
+            int current = PLATFORM.readDisableSleep();
+            if (current != 1) {
+                restoreDisableSleepForeground(priorDisableSleep);
+                throw new IOException("failed to enable --even-lid; SleepDisabled is " + current);
+            }
+
+            List<String> cmd = new ArrayList<>(selfCommand());
+            cmd.add("__supervise_lid__");
+            cmd.add(noDisplay ? "i" : "d");
+            cmd.add(timeoutSec == null ? "" : String.valueOf(timeoutSec));
+            cmd.add(waitPid == null ? "" : String.valueOf(waitPid));
+            cmd.add(String.valueOf(priorDisableSleep));
+            cmd.add(trigger);
+            cmd.add(supervisorDetail);
+            cmd.add(chargeTarget == null ? "" : String.valueOf(chargeTarget));
+            supervisor = spawnDetachedProcess(cmd);
+
+            Session s = waitForSupervisorSession(supervisor.pid(), true);
+            if (s == null) {
+                throw new IOException("lid supervisor failed to publish session state");
+            }
+            supervisorOwnsSetting = true;
+            printStartConfirmation(s);
+        } catch (Exception e) {
+            if (!supervisorOwnsSetting) {
+                if (supervisor != null) destroyProcess(supervisor);
+                boolean restoredOrUnchanged = false;
+                try {
+                    if (disableSleepMayBeChanged || PLATFORM.readDisableSleep() != priorDisableSleep) {
+                        restoreDisableSleepForeground(priorDisableSleep);
+                    }
+                    restoredOrUnchanged = true;
+                } catch (Exception restoreFailure) {
+                    e.addSuppressed(restoreFailure);
+                }
+                if (recoveryRecordWritten && restoredOrUnchanged) {
+                    Files.deleteIfExists(STATE_FILE);
+                }
+            }
+            throw e;
+        }
+    }
+
+    static Session writeLidStartupRecoveryRecord(String trigger, String detail, String mode,
+                                                 Long timeoutSec, int priorDisableSleep) throws Exception {
+        Session s = new Session();
+        s.pid = ProcessHandle.current().pid();
+        s.mode = mode;
+        s.trigger = trigger;
+        s.detail = detail;
+        s.startedAt = Instant.now();
+        s.endsAt = timeoutSec == null ? null : s.startedAt.plusSeconds(timeoutSec);
+        s.evenLid = true;
+        s.priorDisableSleep = priorDisableSleep;
+        s.phase = PHASE_ENABLING;
+        s.captureProcessIdentity();
+        Session.write(s);
+        return s;
+    }
+
     static void startSupervisor(int chargeTarget, String mode, boolean noDisplay) throws Exception {
         Supervisor.BatteryStatus status = Supervisor.readBatteryStatus();
         Supervisor.ChargePlan plan = Supervisor.planCharge(chargeTarget, status);
@@ -196,37 +314,292 @@ public final class Wake {
         printStartConfirmation(s);
     }
 
-    static void status() throws Exception {
-        Session s = Session.readIfAlive();
-        if (s == null) {
-            System.out.println("wake: no active session");
+    static void recoverStaleLidSessionForeground() throws Exception {
+        FileLock lock = Session.acquireLock();
+        try {
+            recoverStaleLidSessionUnlocked();
+        } finally {
+            Session.releaseLock(lock);
+        }
+    }
+
+    static void recoverStaleLidSessionUnlocked() throws Exception {
+        Session.SavedState state = Session.readSavedForRecovery();
+        if (state == null) return;
+        if (state.malformed != null) {
+            recoverMalformedLidSessionUnlocked(state.malformed);
             return;
         }
-        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
-        long elapsedSec = java.time.Duration.between(s.startedAt, Instant.now()).getSeconds();
-        String remaining = s.endsAt == null
-                ? "—"
-                : prettyDuration(Math.max(0, java.time.Duration.between(Instant.now(), s.endsAt).getSeconds()));
-        System.out.printf("wake: session active (pid %d)%n", s.pid);
-        System.out.printf("  mode      : %s%n", s.mode);
-        System.out.printf("  trigger   : %s (%s)%n", s.trigger, s.detail);
-        System.out.printf("  started   : %s (%s ago)%n", fmt.format(s.startedAt), prettyDuration(elapsedSec));
-        System.out.printf("  remaining : %s%n", remaining);
+        Session saved = state.session;
+        if (saved == null || saved.matchesLiveProcess()) return;
+        if (saved.evenLid) {
+            if (!PLATFORM.supportsEvenLid()) {
+                throw new IOException("stale --even-lid session found, but this platform cannot restore SleepDisabled");
+            }
+            int current = PLATFORM.readDisableSleep();
+            if (current != saved.priorDisableSleep) {
+                restoreDisableSleepWithPromptIfPossible(
+                        saved.priorDisableSleep,
+                        "crashed lid session needs sudo recovery, but no interactive terminal is available");
+                int after = PLATFORM.readDisableSleep();
+                if (after != saved.priorDisableSleep) {
+                    printSleepRestoreRescue(saved.priorDisableSleep);
+                    throw new IOException("failed to recover crashed lid session; SleepDisabled is " + after);
+                }
+                if (saved.priorDisableSleep == 0) {
+                    System.err.println("wake: recovered a crashed lid session — restored normal sleep");
+                } else {
+                    System.err.println("wake: recovered a crashed lid session — restored prior SleepDisabled value");
+                }
+            }
+        }
+        Files.deleteIfExists(STATE_FILE);
+    }
+
+    static void recoverMalformedLidSessionUnlocked(Session.MalformedState malformed) throws Exception {
+        if (!PLATFORM.supportsEvenLid()) {
+            if (malformed.hasLidRecoveryHints()) {
+                throw new IOException("malformed --even-lid recovery state found at " + STATE_FILE
+                        + ", but this platform cannot restore SleepDisabled");
+            }
+            Files.deleteIfExists(STATE_FILE);
+            return;
+        }
+        recoverMalformedLidSessionUnlocked(malformed, platformDisableSleepOps(), System.console() != null);
+    }
+
+    static void recoverMalformedLidSessionUnlocked(Session.MalformedState malformed,
+                                                  DisableSleepOps sleepOps,
+                                                  boolean hasConsole) throws Exception {
+        Integer current = null;
+        try {
+            current = sleepOps.readDisableSleep();
+        } catch (Exception e) {
+            if (!malformed.hasLidRecoveryHints()) {
+                Files.deleteIfExists(STATE_FILE);
+                return;
+            }
+        }
+
+        if (!malformed.hasLidRecoveryHints() && (current == null || current != 1)) {
+            Files.deleteIfExists(STATE_FILE);
+            return;
+        }
+
+        int safeRestore = 0;
+        System.err.printf("wake: malformed --even-lid recovery state at %s; using safe SleepDisabled=0 recovery%n",
+                STATE_FILE);
+        if (malformed.parsedPriorDisableSleep != null && malformed.parsedPriorDisableSleep != safeRestore) {
+            System.err.printf("wake: malformed state contained priorDisableSleep=%d; safe recovery still uses 0%n",
+                    malformed.parsedPriorDisableSleep);
+        }
+        printSleepRestoreCommand(safeRestore);
+
+        if (current != null && current == safeRestore) {
+            Files.deleteIfExists(STATE_FILE);
+            return;
+        }
+
+        restoreDisableSleepWithPromptIfPossible(
+                safeRestore,
+                "malformed lid recovery state needs sudo recovery, but no interactive terminal is available",
+                sleepOps,
+                hasConsole);
+        int after = sleepOps.readDisableSleep();
+        if (after != safeRestore) {
+            printSleepRestoreRescue(safeRestore);
+            throw new IOException("failed to recover malformed lid session; SleepDisabled is " + after);
+        }
+        Files.deleteIfExists(STATE_FILE);
+    }
+
+    static Session waitForSupervisorSession(long supervisorPid, boolean evenLid) throws Exception {
+        for (int i = 0; i < 50; i++) {
+            Session s = Session.readIfAlive();
+            if (s != null && s.pid == supervisorPid && s.evenLid == evenLid) return s;
+            if (!isAlive(supervisorPid)) break;
+            Thread.sleep(100);
+        }
+        return null;
+    }
+
+    static void restoreDisableSleepForeground(int priorDisableSleep) throws Exception {
+        restoreDisableSleepForeground(priorDisableSleep, platformDisableSleepOps());
+    }
+
+    static void restoreDisableSleepForeground(int priorDisableSleep, DisableSleepOps sleepOps) throws Exception {
+        try {
+            sleepOps.setDisableSleepForeground(priorDisableSleep);
+        } catch (Exception e) {
+            printSleepRestoreRescue(priorDisableSleep);
+            throw e;
+        }
+        int after;
+        try {
+            after = sleepOps.readDisableSleep();
+        } catch (Exception e) {
+            printSleepRestoreRescue(priorDisableSleep);
+            throw e;
+        }
+        if (after != priorDisableSleep) {
+            printSleepRestoreRescue(priorDisableSleep);
+            throw new IOException("failed to restore SleepDisabled to " + priorDisableSleep + "; current value is " + after);
+        }
+    }
+
+    static void restoreDisableSleepWithPromptIfPossible(int priorDisableSleep, String noConsoleMessage) throws Exception {
+        restoreDisableSleepWithPromptIfPossible(
+                priorDisableSleep,
+                noConsoleMessage,
+                platformDisableSleepOps(),
+                System.console() != null);
+    }
+
+    static void restoreDisableSleepWithPromptIfPossible(int priorDisableSleep, String noConsoleMessage,
+                                                        DisableSleepOps sleepOps, boolean hasConsole) throws Exception {
+        try {
+            if (sleepOps.setDisableSleepNonInteractive(priorDisableSleep)
+                    && sleepOps.readDisableSleep() == priorDisableSleep) {
+                return;
+            }
+        } catch (Exception ignored) {}
+        if (!hasConsole) {
+            printSleepRestoreRescue(priorDisableSleep);
+            throw new IOException(noConsoleMessage);
+        }
+        restoreDisableSleepForeground(priorDisableSleep, sleepOps);
+    }
+
+    static void verifyDisableSleepRestoredAfterStop(Session s) throws Exception {
+        for (int i = 0; i < 20; i++) {
+            if (PLATFORM.readDisableSleep() == s.priorDisableSleep) return;
+            Thread.sleep(250);
+        }
+        int current = PLATFORM.readDisableSleep();
+        if (current == s.priorDisableSleep) return;
+        restoreDisableSleepWithPromptIfPossible(
+                s.priorDisableSleep,
+                "lid supervisor did not restore SleepDisabled, and no interactive terminal is available for sudo recovery");
+        int after = PLATFORM.readDisableSleep();
+        if (after != s.priorDisableSleep) {
+            printSleepRestoreRescue(s.priorDisableSleep);
+            throw new IOException("failed to restore SleepDisabled to " + s.priorDisableSleep + "; current value is " + after);
+        }
+        System.err.printf("wake: restored SleepDisabled to %d after lid supervisor exit%n", s.priorDisableSleep);
+    }
+
+    static void printSleepRestoreCommand(int value) {
+        System.err.printf("wake: manual sleep restore command: sudo pmset -a disablesleep %d%n", value);
+        printSleepStatePath();
+    }
+
+    static void printSleepRestoreRescue(int value) {
+        System.err.printf("wake: could not restore sleep — run: sudo pmset -a disablesleep %d%n", value);
+        printSleepStatePath();
+    }
+
+    static void printSleepStatePath() {
+        System.err.printf("wake: recovery state: %s%n", STATE_FILE);
+    }
+
+    static DisableSleepOps platformDisableSleepOps() {
+        return new DisableSleepOps() {
+            @Override
+            public int readDisableSleep() throws Exception {
+                return PLATFORM.readDisableSleep();
+            }
+
+            @Override
+            public boolean setDisableSleepNonInteractive(int value) throws Exception {
+                return PLATFORM.setDisableSleepNonInteractive(value);
+            }
+
+            @Override
+            public void setDisableSleepForeground(int value) throws Exception {
+                PLATFORM.setDisableSleepForeground(value);
+            }
+        };
+    }
+
+    static void terminateSessionProcess(long pid) throws InterruptedException {
+        ProcessHandle handle = ProcessHandle.of(pid).orElse(null);
+        if (handle == null || !handle.isAlive()) return;
+        try { handle.destroy(); } catch (Exception ignored) {}
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (handle.isAlive() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(100);
+        }
+        if (!handle.isAlive()) return;
+        try { handle.destroyForcibly(); } catch (Exception ignored) {}
+        deadline = System.currentTimeMillis() + 1_000;
+        while (handle.isAlive() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(100);
+        }
+    }
+
+    static String evenLidUnsupportedMessage() {
+        return "--even-lid is macOS-only; Linux already handles lid-switch inhibition through systemd when privileged";
+    }
+
+    static void ensureSudoForEvenLid() throws Exception {
+        if (System.console() == null) {
+            throw new IOException("--even-lid needs an interactive terminal for the sudo prompt");
+        }
+        try {
+            if (PLATFORM.refreshSudoNonInteractive()) return;
+        } catch (Exception ignored) {}
+        if (!PLATFORM.authenticateSudo()) {
+            throw new IOException("sudo authentication failed; --even-lid was not enabled");
+        }
+    }
+
+    static void status() throws Exception {
+        FileLock lock = Session.acquireLock();
+        try {
+            recoverStaleLidSessionUnlocked();
+            Session s = Session.readIfAlive();
+            if (s == null) {
+                System.out.println("wake: no active session");
+                return;
+            }
+            DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
+            long elapsedSec = java.time.Duration.between(s.startedAt, Instant.now()).getSeconds();
+            String remaining = s.endsAt == null
+                    ? "—"
+                    : prettyDuration(Math.max(0, java.time.Duration.between(Instant.now(), s.endsAt).getSeconds()));
+            System.out.printf("wake: session active (pid %d)%n", s.pid);
+            System.out.printf("  mode      : %s%n", s.mode);
+            System.out.printf("  trigger   : %s (%s)%n", s.trigger, s.detail);
+            System.out.printf("  started   : %s (%s ago)%n", fmt.format(s.startedAt), prettyDuration(elapsedSec));
+            System.out.printf("  remaining : %s%n", remaining);
+            if (s.evenLid) {
+                System.out.printf("  even lid  : active (restore SleepDisabled=%d, state %s)%n",
+                        s.priorDisableSleep, STATE_FILE);
+            }
+        } finally {
+            Session.releaseLock(lock);
+        }
     }
 
     static void stop() throws Exception {
-        Session s = Session.readIfAlive();
-        if (s == null) {
-            System.out.println("wake: no active session");
-            try { Files.deleteIfExists(STATE_FILE); } catch (IOException ignored) {}
-            return;
-        }
+        FileLock lock = Session.acquireLock();
         try {
-            ProcessHandle.of(s.pid).ifPresent(ProcessHandle::destroy);
-        } catch (Exception ignored) {}
-        Thread.sleep(200);
-        Files.deleteIfExists(STATE_FILE);
-        System.out.printf("wake: stopped (pid %d, %s)%n", s.pid, s.trigger);
+            recoverStaleLidSessionUnlocked();
+            Session s = Session.readIfAlive();
+            if (s == null) {
+                System.out.println("wake: no active session");
+                try { Files.deleteIfExists(STATE_FILE); } catch (IOException ignored) {}
+                return;
+            }
+            terminateSessionProcess(s.pid);
+            if (s.evenLid) {
+                verifyDisableSleepRestoredAfterStop(s);
+            }
+            Files.deleteIfExists(STATE_FILE);
+            System.out.printf("wake: stopped (pid %d, %s)%n", s.pid, s.trigger);
+        } finally {
+            Session.releaseLock(lock);
+        }
     }
 
     static void printStartConfirmation(Session s) {
@@ -238,7 +611,12 @@ public final class Wake {
         System.out.printf("  trigger : %s (%s)%n", s.trigger, s.detail);
         System.out.printf("  started : %s%n", startsAt);
         System.out.printf("  ends    : %s%n", endsAt);
-        PLATFORM.startNote().ifPresent(System.out::println);
+        if (s.evenLid) {
+            System.out.println("note: --even-lid is active; this Mac should stay awake with the lid closed until the session ends");
+            System.out.println("caution: closed lid + battery + no external display can run hot and drain quickly");
+        } else {
+            PLATFORM.startNote().ifPresent(System.out::println);
+        }
     }
 
     static long spawnDetached(List<String> cmd) throws IOException {
@@ -328,7 +706,9 @@ public final class Wake {
     static void startForever(String[] args) throws Exception {
         String[] rest = Arrays.copyOfRange(args, 1, args.length);
         for (String arg : rest) {
-            if (!"--no-display".equals(arg)) throw new UsageError("forever only accepts --no-display");
+            if (!"--no-display".equals(arg) && !"--even-lid".equals(arg)) {
+                throw new UsageError("forever only accepts --no-display and --even-lid");
+            }
         }
         start(rest);
     }
@@ -373,7 +753,7 @@ public final class Wake {
                 platforms:
                   macOS uses caffeinate; Linux uses systemd-inhibit and requires systemd;
                   Windows uses PowerShell + SetThreadExecutionState
-                  note: closing the lid still sleeps the mac — macOS forced sleep can't be blocked by user apps
+                  note: closing the lid still sleeps the mac unless you use --even-lid
 
                 interactive:
                   wake                       open the picker on macOS/Linux; on Windows, start indefinitely
@@ -387,6 +767,7 @@ public final class Wake {
                   wake --while-pid PID       stay awake while PID is running
                   wake --while-app NAME      stay awake while named app/process is running
                   wake --no-display          prevent system sleep only, allow display sleep
+                  wake --even-lid            macOS only: use sudo to stay awake with lid closed
                   wake status                show current session
                   wake stop                  end current session
                   wake version               print version

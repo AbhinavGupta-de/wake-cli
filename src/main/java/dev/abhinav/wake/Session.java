@@ -22,20 +22,46 @@ final class Session {
     long processStartMs;
     String processCommand;
     String processCommandLine;
+    boolean evenLid;
+    int priorDisableSleep;
+    String phase;
 
     static Session readIfAlive() throws IOException {
         return readIfAlive(false);
     }
 
     static Session readIfAlive(boolean mayDeleteMalformed) throws IOException {
+        Session s = readSaved(mayDeleteMalformed);
+        if (s == null) return null;
+        if (!s.matchesLiveProcess()) {
+            try { Files.deleteIfExists(Wake.STATE_FILE); } catch (IOException ignored) {}
+            return null;
+        }
+        return s;
+    }
+
+    static Session readSaved(boolean mayDeleteMalformed) throws IOException {
+        SavedState state = readSavedForRecovery();
+        if (state == null) return null;
+        if (state.session != null) return state.session;
+        if (state.malformed != null && mayDeleteMalformed && !state.malformed.hasLidRecoveryHints()) {
+            try { Files.deleteIfExists(Wake.STATE_FILE); } catch (IOException ignored) {}
+        }
+        return null;
+    }
+
+    static SavedState readSavedForRecovery() throws IOException {
         if (!Files.exists(Wake.STATE_FILE)) return null;
         Properties props = new Properties();
         try (var in = Files.newBufferedReader(Wake.STATE_FILE)) {
             props.load(in);
         } catch (IOException e) {
-            if (mayDeleteMalformed) try { Files.deleteIfExists(Wake.STATE_FILE); } catch (IOException ignored) {}
-            return null;
+            return SavedState.malformed(MalformedState.unreadable(e));
         }
+        return parseSavedState(props);
+    }
+
+    private static SavedState parseSavedState(Properties props) {
         Session s = new Session();
         try {
             s.pid = Long.parseLong(props.getProperty("pid", "0"));
@@ -48,15 +74,13 @@ final class Session {
             s.processStartMs = Long.parseLong(props.getProperty("processStartMs"));
             s.processCommand = props.getProperty("processCommand", "");
             s.processCommandLine = props.getProperty("processCommandLine", "");
+            s.evenLid = Boolean.parseBoolean(props.getProperty("evenLid", "false"));
+            s.priorDisableSleep = parseDisableSleep(props.getProperty("priorDisableSleep", "0"));
+            s.phase = props.getProperty("phase", "active");
         } catch (Exception ex) {
-            if (mayDeleteMalformed) try { Files.deleteIfExists(Wake.STATE_FILE); } catch (IOException ignored) {}
-            return null;
+            return SavedState.malformed(MalformedState.from(props, ex));
         }
-        if (!s.matchesLiveProcess()) {
-            try { Files.deleteIfExists(Wake.STATE_FILE); } catch (IOException ignored) {}
-            return null;
-        }
-        return s;
+        return SavedState.valid(s);
     }
 
     static FileLock acquireLock() throws IOException {
@@ -110,6 +134,9 @@ final class Session {
         props.setProperty("processStartMs", String.valueOf(s.processStartMs));
         props.setProperty("processCommand", s.processCommand == null ? "" : s.processCommand);
         props.setProperty("processCommandLine", s.processCommandLine == null ? "" : s.processCommandLine);
+        props.setProperty("evenLid", String.valueOf(s.evenLid));
+        props.setProperty("priorDisableSleep", String.valueOf(s.priorDisableSleep));
+        props.setProperty("phase", s.phase == null ? "active" : s.phase);
         Path tmp = Wake.STATE_DIR.resolve("session.properties.tmp");
         try (var out = Files.newBufferedWriter(tmp)) {
             props.store(out, "wake session");
@@ -122,7 +149,7 @@ final class Session {
         }
     }
 
-    private boolean matchesLiveProcess() {
+    boolean matchesLiveProcess() {
         ProcessHandle handle = ProcessHandle.of(pid).orElse(null);
         if (handle == null || !handle.isAlive()) return false;
         ProcessHandle.Info info = handle.info();
@@ -142,6 +169,73 @@ final class Session {
         return Wake.PLATFORM.expectedCommandBasenames().contains(base)
                 || line.contains("wake.jar")
                 || line.contains("dev.abhinav.wake.wake");
+    }
+
+    private static int parseDisableSleep(String raw) {
+        int value = Integer.parseInt(raw.trim());
+        if (value != 0 && value != 1) throw new IllegalArgumentException("priorDisableSleep must be 0 or 1");
+        return value;
+    }
+
+    static final class SavedState {
+        final Session session;
+        final MalformedState malformed;
+
+        private SavedState(Session session, MalformedState malformed) {
+            this.session = session;
+            this.malformed = malformed;
+        }
+
+        static SavedState valid(Session session) {
+            return new SavedState(session, null);
+        }
+
+        static SavedState malformed(MalformedState malformed) {
+            return new SavedState(null, malformed);
+        }
+    }
+
+    static final class MalformedState {
+        final boolean propertiesReadable;
+        final boolean evenLidTrue;
+        final boolean hasPriorDisableSleep;
+        final Integer parsedPriorDisableSleep;
+        final String reason;
+
+        private MalformedState(boolean propertiesReadable, boolean evenLidTrue,
+                               boolean hasPriorDisableSleep, Integer parsedPriorDisableSleep,
+                               Exception reason) {
+            this.propertiesReadable = propertiesReadable;
+            this.evenLidTrue = evenLidTrue;
+            this.hasPriorDisableSleep = hasPriorDisableSleep;
+            this.parsedPriorDisableSleep = parsedPriorDisableSleep;
+            this.reason = reason == null ? "unknown parse failure" : reason.getMessage();
+        }
+
+        static MalformedState unreadable(Exception reason) {
+            return new MalformedState(false, false, false, null, reason);
+        }
+
+        static MalformedState from(Properties props, Exception reason) {
+            String evenLid = props.getProperty("evenLid", "");
+            String prior = props.getProperty("priorDisableSleep");
+            Integer parsedPrior = null;
+            if (prior != null) {
+                try {
+                    parsedPrior = parseDisableSleep(prior);
+                } catch (Exception ignored) {}
+            }
+            return new MalformedState(
+                    true,
+                    "true".equalsIgnoreCase(evenLid.trim()),
+                    props.containsKey("priorDisableSleep"),
+                    parsedPrior,
+                    reason);
+        }
+
+        boolean hasLidRecoveryHints() {
+            return evenLidTrue || hasPriorDisableSleep;
+        }
     }
 
     private static void closeQuietly(FileChannel ch) {

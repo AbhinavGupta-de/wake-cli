@@ -12,6 +12,7 @@ A command-line awake controller for macOS, Linux, and Windows.
 - Process-bound sessions with `wake --while-pid PID`.
 - App-bound sessions with `wake --while-app NAME`.
 - Display sleep control with `--no-display`.
+- macOS lid-closed sessions with `--even-lid`.
 - `wake status` and `wake stop` for active sessions.
 
 ## Demo
@@ -35,6 +36,8 @@ On macOS/Linux, running `wake` in an interactive terminal opens the picker:
   ↑↓/jk navigate · ↵ select · d display-sleep [off] · q quit
 ```
 
+On macOS, choosing **Indefinite** asks `Keep awake with the lid closed too? (needs sudo) [y/N]`. The prompt defaults to no; answering `y` starts the indefinite session with `--even-lid` (which prompts for sudo on the normal terminal after the picker exits), while anything else starts a normal indefinite session. On Linux and Windows the prompt does not appear and Indefinite behaves as before.
+
 ## Supported Platforms
 
 ### macOS
@@ -43,7 +46,13 @@ macOS uses `caffeinate` for sleep assertions and `pmset` for battery state.
 
 #### Limitations
 
-`wake` blocks idle sleep on macOS; it cannot block forced sleep. Closing the lid or choosing Sleep from the Apple menu still sleeps the Mac. Amphetamine has the same macOS constraint. The root-only workaround is `sudo pmset disablesleep 1`, which is deliberately not built in.
+`wake` blocks idle sleep on macOS. Closing the lid or choosing Sleep from the Apple menu is forced sleep and still sleeps the Mac unless you use `--even-lid`, which uses the root clamshell setting `pmset -a disablesleep 1`.
+
+`wake --even-lid` is macOS-only and requires sudo. It is intended for long background work where you lock the screen, close the lid, and need agents or other processes to keep running. It preserves the previous `SleepDisabled` value: if clamshell mode was already enabled before `wake`, `wake stop` restores it to enabled; otherwise it restores normal sleep.
+
+Because `SleepDisabled` is a global setting and is not tied to a process, `wake --even-lid` runs a detached supervisor that owns teardown. The supervisor keeps sudo fresh, restores the prior `SleepDisabled` value on exit, and leaves recovery state behind if non-interactive restore cannot be verified. Every foreground `wake start`, `wake status`, and `wake stop` checks for a crashed lid supervisor and prompts with sudo if needed to restore the previous setting.
+
+Caution: running closed-lid on battery, especially without an external display or cooling, can run hot and drain quickly.
 
 This differs from Linux, where systemd can inhibit lid-switch sleep.
 
@@ -122,6 +131,8 @@ wake forever
 wake --until 23:00
 wake --until-charge 80
 wake --while-app "Final Cut Pro"
+wake --even-lid
+wake --even-lid 2h
 wake status
 wake stop
 wake help

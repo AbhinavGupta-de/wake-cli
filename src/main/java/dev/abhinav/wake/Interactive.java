@@ -117,7 +117,7 @@ final class Interactive {
                     i -> i.runAction(() -> Wake.stop()), true));
         } else {
             items.add(new MenuItem("Indefinite",          "stay awake forever",
-                    i -> i.startWith(), true));
+                    i -> i.startIndefinite(), true));
             items.add(new MenuItem("For a duration…",     "1h, 30m, 1h30m, 90s",
                     i -> i.askAndStart("Duration (e.g. 1h30m, 90s)", null), true));
             items.add(new MenuItem("Until clock time…",   "stay awake until HH:MM",
@@ -219,6 +219,37 @@ final class Interactive {
 
     private void startWith(String... extra) {
         runAction(() -> Wake.start(buildArgs(extra)));
+    }
+
+    /**
+     * Indefinite start. Runs as an exitAfter action, i.e. AFTER cleanup() has torn down
+     * raw mode + the alt-screen, so any sub-prompt and the subsequent sudo password prompt
+     * appear on a clean normal terminal where System.console() is still valid (required by
+     * the --even-lid M1 rule). On macOS (supportsEvenLid) we offer the lid-survival choice;
+     * elsewhere we behave exactly as before. The actual privileged work is delegated to
+     * Wake.start with --even-lid in the args so all the existing safety machinery runs.
+     */
+    private void startIndefinite() {
+        if (Wake.PLATFORM.supportsEvenLid() && askYesNo("Keep awake with the lid closed too? (needs sudo)")) {
+            startWith("--even-lid");
+        } else {
+            startWith();
+        }
+    }
+
+    /** Cooked-mode y/N sub-prompt defaulting to NO. Mirrors readLine; only y/Y... means yes. */
+    private boolean askYesNo(String prompt) {
+        System.out.print("\n  " + FG_CYAN + prompt + RESET + " " + DIM + "[y/N]" + RESET + " ");
+        System.out.flush();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
+        try {
+            String answer = reader.readLine();
+            if (answer == null) return false;
+            answer = answer.trim();
+            return !answer.isEmpty() && (answer.charAt(0) == 'y' || answer.charAt(0) == 'Y');
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private void askAndStart(String prompt, String flag) {

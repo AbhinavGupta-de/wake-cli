@@ -29,6 +29,36 @@ interface Platform {
         return true;
     }
 
+    /** Whether this platform can keep running through macOS lid-close sleep. */
+    default boolean supportsEvenLid() {
+        return false;
+    }
+
+    /** Current macOS SleepDisabled value. Missing/unset is reported as 0. */
+    default int readDisableSleep() throws IOException, InterruptedException {
+        throw new UnsupportedOperationException("--even-lid is not supported on this platform");
+    }
+
+    /** Foreground sudo validation for commands that may prompt the user. */
+    default boolean authenticateSudo() throws IOException, InterruptedException {
+        throw new UnsupportedOperationException("--even-lid is not supported on this platform");
+    }
+
+    /** Foreground SleepDisabled setter. May prompt via sudo. */
+    default void setDisableSleepForeground(int value) throws IOException, InterruptedException {
+        throw new UnsupportedOperationException("--even-lid is not supported on this platform");
+    }
+
+    /** Non-interactive SleepDisabled setter for detached teardown. */
+    default boolean setDisableSleepNonInteractive(int value) throws IOException, InterruptedException {
+        throw new UnsupportedOperationException("--even-lid is not supported on this platform");
+    }
+
+    /** Non-interactive sudo timestamp refresh for long detached sessions. */
+    default boolean refreshSudoNonInteractive() throws IOException, InterruptedException {
+        throw new UnsupportedOperationException("--even-lid is not supported on this platform");
+    }
+
     /** Note to print after the start confirmation for this invocation, if any. */
     default Optional<String> startNote() {
         return Optional.empty();

@@ -3,10 +3,13 @@ package dev.abhinav.wake;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Instant;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 final class Supervisor {
     private static final long POLL_INTERVAL_MS = 30_000;
+    private static final long LID_POLL_INTERVAL_MS = 1_000;
+    private static final long SUDO_HEARTBEAT_MS = 180_000;
 
     static void runCharge(String[] args) throws Exception {
         if (args.length < 4) throw new IllegalStateException("supervisor: bad args");
@@ -73,6 +76,101 @@ final class Supervisor {
         try { Files.deleteIfExists(Wake.STATE_FILE); } catch (Throwable ignored) {}
     }
 
+    static void runLid(String[] args) throws Exception {
+        if (args.length < 7) throw new IllegalStateException("lid supervisor: bad args");
+        if (!Wake.PLATFORM.supportsEvenLid()) return;
+
+        String modeChar = args[1];
+        if (!"d".equals(modeChar) && !"i".equals(modeChar)) {
+            throw new IllegalStateException("lid supervisor: bad caffeinate mode");
+        }
+        boolean noDisplay = "i".equals(modeChar);
+        Long timeoutSec = optionalLong(args[2]);
+        Long waitPid = optionalLong(args[3]);
+        int priorDisableSleep = parseDisableSleep(args[4]);
+        String trigger = args[5];
+        String detail = args[6];
+        Integer chargeTarget = args.length > 7 && !args[7].isBlank()
+                ? Integer.parseInt(args[7])
+                : null;
+
+        Boolean chargingUpValue = null;
+        if (chargeTarget != null) {
+            BatteryStatus initial = readBatteryStatus();
+            ChargePlan plan = planCharge(chargeTarget, initial);
+            if (plan.alreadyMet) return;
+            chargingUpValue = plan.chargingUp;
+        }
+        final Boolean chargingUp = chargingUpValue;
+
+        AtomicReference<Process> keepAwakeProcRef = new AtomicReference<>();
+        AtomicBoolean cleaned = new AtomicBoolean(false);
+        Runnable cleanup = () -> {
+            if (!cleaned.compareAndSet(false, true)) return;
+            boolean restored = false;
+            try {
+                int current = Wake.PLATFORM.readDisableSleep();
+                if (current != priorDisableSleep) {
+                    Wake.PLATFORM.setDisableSleepNonInteractive(priorDisableSleep);
+                }
+                restored = Wake.PLATFORM.readDisableSleep() == priorDisableSleep;
+            } catch (Throwable ignored) {}
+
+            Process p = keepAwakeProcRef.get();
+            try { if (p != null) Wake.destroyProcess(p); } catch (Throwable ignored) {}
+
+            if (restored) {
+                try { Files.deleteIfExists(Wake.STATE_FILE); } catch (Throwable ignored) {}
+            } else {
+                Wake.printSleepRestoreRescue(priorDisableSleep);
+            }
+        };
+        Runtime.getRuntime().addShutdownHook(new Thread(cleanup, "wake-lid-teardown"));
+
+        var keepAwakeCmd = Wake.PLATFORM.keepAwakeCommand(noDisplay, timeoutSec, waitPid);
+        ProcessBuilder keepAwake = new ProcessBuilder(keepAwakeCmd);
+        keepAwake.redirectInput(ProcessBuilder.Redirect.from(Wake.PLATFORM.devNull()));
+        keepAwake.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+        keepAwake.redirectError(ProcessBuilder.Redirect.DISCARD);
+
+        Process keepAwakeProc = null;
+        try {
+            keepAwakeProc = keepAwake.start();
+            keepAwakeProcRef.set(keepAwakeProc);
+            Wake.requireChildAlive(keepAwakeProc.pid(), keepAwakeCmd);
+
+            Session s = new Session();
+            s.pid = ProcessHandle.current().pid();
+            s.mode = noDisplay ? "system-only" : "display+system";
+            s.trigger = trigger;
+            s.detail = detail;
+            s.startedAt = Instant.now();
+            s.endsAt = timeoutSec == null ? null : s.startedAt.plusSeconds(timeoutSec);
+            s.evenLid = true;
+            s.priorDisableSleep = priorDisableSleep;
+            s.phase = Wake.PHASE_ACTIVE;
+            s.captureProcessIdentity();
+            Session.write(s);
+
+            long startMs = System.currentTimeMillis();
+            long nextSudoHeartbeatMs = startMs + SUDO_HEARTBEAT_MS;
+            while (true) {
+                Thread.sleep(LID_POLL_INTERVAL_MS);
+                long nowMs = System.currentTimeMillis();
+                if (!keepAwakeProc.isAlive()) break;
+                if (timeoutSec != null && nowMs - startMs >= timeoutSec * 1_000L) break;
+                if (waitPid != null && !Wake.isAlive(waitPid)) break;
+                if (chargeTarget != null && chargeReached(chargeTarget, chargingUp)) break;
+                if (nowMs >= nextSudoHeartbeatMs) {
+                    try { Wake.PLATFORM.refreshSudoNonInteractive(); } catch (Exception ignored) {}
+                    nextSudoHeartbeatMs = nowMs + SUDO_HEARTBEAT_MS;
+                }
+            }
+        } finally {
+            cleanup.run();
+        }
+    }
+
     static int readBatteryPct() throws IOException, InterruptedException {
         return readBatteryStatus().percent;
     }
@@ -136,5 +234,25 @@ final class Supervisor {
         static ChargePlan waiting(boolean chargingUp) {
             return new ChargePlan(false, chargingUp);
         }
+    }
+
+    private static boolean chargeReached(int target, Boolean chargingUp) {
+        if (chargingUp == null) return false;
+        try {
+            BatteryStatus status = readBatteryStatus();
+            return chargingUp ? status.percent >= target : status.percent <= target;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static Long optionalLong(String raw) {
+        return raw == null || raw.isBlank() ? null : Long.parseLong(raw);
+    }
+
+    private static int parseDisableSleep(String raw) {
+        int value = Integer.parseInt(raw);
+        if (value != 0 && value != 1) throw new IllegalArgumentException("priorDisableSleep must be 0 or 1");
+        return value;
     }
 }
